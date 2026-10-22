@@ -154,7 +154,7 @@ Write-Ok "$($py.Version) - $($py.Exe)"
 Write-Step "2/7  Check Claude Desktop"
 $claudeInstalled = $false
 try {
-    $list = & winget list --name "Claude" 2>$null
+    $list = & winget list --name "Claude" --accept-source-agreements --disable-interactivity 2>$null
     if ($list -match "Anthropic\.Claude") { $claudeInstalled = $true }
 } catch { }
 if (-not $claudeInstalled) {
