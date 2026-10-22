@@ -291,7 +291,13 @@ The connector exposes 8 tools that are individually cheap to call (~0.5-3s each)
 
 **Claude doesn't show the "garmin" connector**
 - Did you **fully restart** Claude Desktop? (also close it from the tray icon, or run `Get-Process claude | Stop-Process -Force`)
-- Verify the config was written in the correct location. **Store version**:
+- Verify the config was written in the correct location. **Current MSIX build** (installer from claude.ai or the Store — if the `Claude-Data` folder exists, this is the only file the app reads):
+  ```powershell
+  Get-Content "$env:LOCALAPPDATA\Claude-Data\claude_pzs8sxrjxfjjc\claude_desktop_config.json"
+  ```
+  Its logs are in `$env:LOCALAPPDATA\Claude\logs\main.log`: a line `no stdio servers connected` means the app did not find the `garmin` entry.
+
+  **Older Store version**:
   ```powershell
   Get-ChildItem "$env:LOCALAPPDATA\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude\claude_desktop_config.json" | Get-Content
   ```

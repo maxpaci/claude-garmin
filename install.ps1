@@ -12,9 +12,10 @@
       5. Collect Garmin credentials (email, password, MFA awareness)
       6. One-time Garmin login (saves tokens in ~/.garminconnect/)
       7. Write claude_desktop_config.json to the correct path
-         (Store/UWP or classic)
+         (MSIX Claude-Data, Store/UWP or classic)
 
     Auto-detects which flavor of Claude Desktop is installed:
+      - MSIX (current): %LOCALAPPDATA%\Claude-Data\claude_<id>\
       - Store/UWP: %LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude\
       - Classic:   %APPDATA%\Claude\
 
@@ -96,7 +97,17 @@ function Refresh-Path {
 }
 
 function Find-ClaudeConfigPath {
-    # Prefer the Store/UWP path; fall back to the classic %APPDATA%\Claude.
+    # 1. Recent MSIX builds (installer from claude.ai or the Store) keep their
+    #    user data OUTSIDE the package, in %LOCALAPPDATA%\Claude-Data\claude_<id>\.
+    #    When that folder exists it is the config the app actually reads, and
+    #    the older paths below are ignored.
+    $dataDirs = Get-ChildItem "$env:LOCALAPPDATA\Claude-Data" -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -like "claude_*" } |
+                Sort-Object LastWriteTime -Descending
+    foreach ($d in $dataDirs) {
+        return @{ Kind = "store-data"; Path = (Join-Path $d.FullName "claude_desktop_config.json"); ExistingDir = $true }
+    }
+    # 2. Older Store/UWP builds: virtualized %APPDATA% inside the package.
     $storePackages = Get-ChildItem "$env:LOCALAPPDATA\Packages" -Directory -ErrorAction SilentlyContinue |
                      Where-Object { $_.Name -like "Claude_*" }
     foreach ($pkg in $storePackages) {
@@ -109,6 +120,7 @@ function Find-ClaudeConfigPath {
         }
         return @{ Kind = "store"; Path = $cfg; ExistingDir = $false }
     }
+    # 3. Classic (non-packaged) install.
     return @{
         Kind = "classic"
         Path = (Join-Path $env:APPDATA "Claude\claude_desktop_config.json")
@@ -321,6 +333,21 @@ $claudeDir = Split-Path $claudeCfg
 Write-Info "Detected version: $($cc.Kind)"
 Write-Info "Config path:      $claudeCfg"
 
+# A running Claude Desktop keeps its settings in memory and may rewrite this
+# file, dropping the new entry. Close it before editing.
+$running = Get-Process -Name "claude" -ErrorAction SilentlyContinue
+if ($running) {
+    Write-Warn2 "Claude Desktop is running and must be closed to apply the config."
+    $ans = Read-Host "    Close it now? [Y/n]"
+    if ($ans -match '^[nN]') {
+        Write-Err2 "Close Claude Desktop (also from the tray icon) and re-run install.bat."
+        exit 1
+    }
+    $running | Stop-Process -Force
+    Start-Sleep -Seconds 3
+    Write-Ok "Claude Desktop closed"
+}
+
 if (-not (Test-Path $claudeDir)) {
     if ($cc.Kind -eq "store") {
         Write-Warn2 "The Store Claude config folder doesn't exist yet."
@@ -361,7 +388,8 @@ if ($cfg.mcpServers.PSObject.Properties.Name -contains 'garmin') {
     $cfg.mcpServers | Add-Member -MemberType NoteProperty -Name garmin -Value $garminEntry
 }
 
-$json = $cfg | ConvertTo-Json -Depth 10
+if (Test-Path $claudeCfg) { Copy-Item $claudeCfg "$claudeCfg.bak" -Force }
+$json = $cfg | ConvertTo-Json -Depth 32
 # UTF-8 without BOM — Claude Desktop is fine either way but consistency matters,
 # and downstream tools that read JSON sometimes choke on a leading BOM.
 [System.IO.File]::WriteAllText($claudeCfg, $json, [System.Text.UTF8Encoding]::new($false))

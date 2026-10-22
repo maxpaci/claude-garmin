@@ -4,7 +4,7 @@
 
 .DESCRIPTION
     Cleanly removes:
-      - the 'garmin' entry in claude_desktop_config.json (both Store and classic)
+      - the 'garmin' entry in claude_desktop_config.json (MSIX Claude-Data, Store and classic)
       - Garmin tokens in ~/.garminconnect/
       - the .venv virtualenv
       - the .env file (credentials)
@@ -39,6 +39,13 @@ function Write-Err2([string]$msg) { Write-Host "    [ERR] $msg" -ForegroundColor
 
 function Get-AllClaudeConfigPaths {
     $paths = @()
+    # Current MSIX builds keep user data outside the package
+    $dataDirs = Get-ChildItem "$env:LOCALAPPDATA\Claude-Data" -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -like "claude_*" }
+    foreach ($d in $dataDirs) {
+        $cfg = Join-Path $d.FullName "claude_desktop_config.json"
+        if (Test-Path $cfg) { $paths += @{ Kind = "store-data"; Path = $cfg } }
+    }
     # Store/UWP versions (there may be more than one across reinstalls)
     $storePackages = Get-ChildItem "$env:LOCALAPPDATA\Packages" -Directory -ErrorAction SilentlyContinue |
                      Where-Object { $_.Name -like "Claude_*" }
@@ -106,7 +113,7 @@ if ($configs.Count -eq 0) {
                 $cfg.mcpServers.PSObject.Properties.Name -contains 'garmin') {
                 $cfg.mcpServers.PSObject.Properties.Remove('garmin')
                 # Write UTF-8 without BOM (see install.ps1 for the same fix).
-                $json = $cfg | ConvertTo-Json -Depth 10
+                $json = $cfg | ConvertTo-Json -Depth 32
                 [System.IO.File]::WriteAllText($c.Path, $json, [System.Text.UTF8Encoding]::new($false))
                 Write-Ok "Removed from $($c.Kind): $($c.Path)"
             } else {
