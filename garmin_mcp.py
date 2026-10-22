@@ -2569,6 +2569,72 @@ def _detect_blocks(power: list[float | None]) -> list[tuple[int, int, str]]:
     return [(s, e, lab) for s, e, lab in merged]
 
 
+def _split_surges(power: list[float | None], bounds: list[tuple[int, int, str]]) -> list[tuple[int, int, str]]:
+    """Carve short surges (12-90 s, >= 10% above the block) out of work blocks.
+
+    Typical trainer pattern: a steady block (e.g. low-cadence force work)
+    ending in a short free-cadence effort. The 30 s smoothing used to find
+    blocks folds that effort into the block (or the next recovery), which
+    skews the block's fade numbers. Here we look at 5 s-smoothed power from
+    the block start up to 30 s into the next block and split out any such run.
+    """
+    n = len(power)
+    p = [v if v is not None else 0.0 for v in power]
+    prefix = [0.0]
+    for v in p:
+        prefix.append(prefix[-1] + v)
+
+    def smooth5(i: int) -> float:
+        a, b = max(0, i - 2), min(n, i + 3)
+        return (prefix[b] - prefix[a]) / (b - a)
+
+    out: list[list[Any]] = [list(b) for b in bounds]
+    result: list[list[Any]] = []
+    i = 0
+    while i < len(out):
+        a, b, kind = out[i]
+        if kind not in ("WORK", "STEADY") or b - a < 90:
+            result.append(out[i])
+            i += 1
+            continue
+        block = sorted(p[a:b])
+        base = block[len(block) // 2]  # median: robust to the surge itself
+        if base <= 0:
+            result.append(out[i])
+            i += 1
+            continue
+        limit = min(n, b + 30) if i + 1 < len(out) else b
+        runs: list[tuple[int, int]] = []
+        start = None
+        for t in range(a, limit):
+            hot = smooth5(t) >= base * 1.10
+            if hot and start is None:
+                start = t
+            elif not hot and start is not None:
+                runs.append((start, t))
+                start = None
+        if start is not None:
+            runs.append((start, limit))
+        runs = [(s0, e0) for s0, e0 in runs if 12 <= e0 - s0 <= 90]
+        cursor = a
+        for s0, e0 in runs:
+            if s0 - cursor >= 20:
+                result.append([cursor, s0, kind])
+            elif result and cursor < s0:
+                result[-1][1] = s0
+            result.append([s0, e0, "SURGE"])
+            cursor = e0
+        if cursor < b:
+            if b - cursor >= 20 or not runs:
+                result.append([cursor, b, kind])
+            else:
+                result[-1][1] = b
+        elif cursor > b and i + 1 < len(out):
+            out[i + 1][0] = cursor  # the surge spilled into the next block
+        i += 1
+    return [(x[0], x[1], x[2]) for x in result if x[1] > x[0]]
+
+
 @mcp.tool()
 def get_ride_trace(activity_id: int, bucket_seconds: int = 30) -> dict[str, Any]:
     """Second-by-second power, cadence and HR of a ride, condensed for analysis.
@@ -2579,7 +2645,8 @@ def get_ride_trace(activity_id: int, bucket_seconds: int = 30) -> dict[str, Any]
         avg/max HR, coasting time
       - blocks: one row per workout step (when the ride followed a
         structured workout) or per work/recovery block detected from the
-        power trace. Each with start, duration, avg power, NP, max power,
+        power trace (short efforts of 12-90 s >= 10% above a work block
+        are split out as type "surge"). Each with start, duration, avg power, NP, max power,
         avg cadence, avg/max HR, and for blocks >= 2 min the fade: power,
         cadence and HR in the first vs last third, plus HR-per-watt drift %
       - cadence: time in cadence bands, and avg cadence in work vs recovery
@@ -2627,19 +2694,22 @@ def get_ride_trace(activity_id: int, bucket_seconds: int = 30) -> dict[str, Any]
         bounds = _lap_boundaries(laps, tr["t0_epoch_s"], n)
         source = "workout_laps"
     else:
-        bounds = _detect_blocks(tr["power"])
+        bounds = _split_surges(tr["power"], _detect_blocks(tr["power"]))
         source = "detected_from_power"
 
     blocks = []
     work_cad: list[float] = []
     rec_cad: list[float] = []
+    surge_cad: list[float] = []
     for i, (a, b, kind) in enumerate(bounds[:60], start=1):
         kind_l = kind.lower() or "active"
         if kind_l == "rest":
             kind_l = "recovery"
         blocks.append({"block": i, "type": kind_l, **_segment_stats(tr, a, b)})
         cads = [c for c in _vals(tr["cadence"][a:b]) if c > 0]
-        if kind_l in ("recovery", "warmup", "cooldown"):
+        if kind_l == "surge":
+            surge_cad.extend(cads)
+        elif kind_l in ("recovery", "warmup", "cooldown"):
             if kind_l == "recovery":
                 rec_cad.extend(cads)
         else:
@@ -2666,6 +2736,7 @@ def get_ride_trace(activity_id: int, bucket_seconds: int = 30) -> dict[str, Any]
         "time_in_band": {k: {"min": _round(v / 60, 1), "pct": _round(v / total * 100, 0)} for k, v in bands.items()},
         "avg_cadence_work_rpm": _round(_mean(work_cad), 0),
         "avg_cadence_recovery_rpm": _round(_mean(rec_cad), 0),
+        "avg_cadence_surge_rpm": _round(_mean(surge_cad), 0),
     }
 
     # Condensed trace, column-oriented to keep it compact.
