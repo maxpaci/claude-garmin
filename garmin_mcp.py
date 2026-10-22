@@ -2341,6 +2341,361 @@ def get_power_curve(days: int = 90, compare_previous: bool = True) -> dict[str, 
 
 
 # ---------------------------------------------------------------------------
+# Tool 23c: get_ride_trace
+# ---------------------------------------------------------------------------
+
+_TRACE_METRICS = {
+    "power": ("directPower",),
+    "cadence": ("directBikeCadence", "directCadence", "directFractionalCadence"),
+    "hr": ("directHeartRate",),
+}
+_TRACE_TIME_KEYS = ("sumElapsedDuration", "sumDuration", "sumMovingDuration")
+_MAX_GAP_S = 10  # longer gaps between samples = pause, not filled
+
+
+def _detail_samples(details: Any) -> tuple[list[dict[str, Any]], list[str]]:
+    """Decode the positional `activityDetailMetrics` into per-sample dicts.
+
+    Same logic as garminconnect.parse_activity_detail_metrics, kept local so
+    older library versions work too. Returns (samples, available_keys).
+    """
+    if not isinstance(details, dict):
+        return [], []
+    index_to_key: dict[int, str] = {}
+    for desc in details.get("metricDescriptors") or []:
+        if not isinstance(desc, dict):
+            continue
+        key, idx = desc.get("key"), desc.get("metricsIndex")
+        if isinstance(key, str) and isinstance(idx, int) and not isinstance(idx, bool) and idx >= 0:
+            index_to_key[idx] = key
+    samples: list[dict[str, Any]] = []
+    for row in details.get("activityDetailMetrics") or []:
+        metrics = (row or {}).get("metrics") or []
+        samples.append({k: metrics[i] for i, k in index_to_key.items() if i < len(metrics)})
+    return samples, sorted(index_to_key.values())
+
+
+def _pick_key(available: list[str], candidates: tuple[str, ...]) -> str | None:
+    return next((k for k in candidates if k in available), None)
+
+
+def _resample_1hz(samples: list[dict[str, Any]], available: list[str]) -> dict[str, Any]:
+    """Turn irregular samples into 1-second arrays (None during pauses).
+
+    Returns {"t0_epoch_s", "power", "cadence", "hr"} where each series is a
+    list indexed by second since the first sample.
+    """
+    ts_key = "directTimestamp" if "directTimestamp" in available else None
+    dur_key = _pick_key(available, _TRACE_TIME_KEYS)
+    keys = {name: _pick_key(available, cands) for name, cands in _TRACE_METRICS.items()}
+
+    points: list[tuple[float, dict[str, Any]]] = []
+    t0_epoch: float | None = None
+    for s in samples:
+        t: float | None = None
+        if ts_key and isinstance(s.get(ts_key), (int, float)):
+            if t0_epoch is None:
+                t0_epoch = s[ts_key] / 1000.0
+            t = s[ts_key] / 1000.0 - t0_epoch
+        elif dur_key and isinstance(s.get(dur_key), (int, float)):
+            t = float(s[dur_key])
+        if t is None or t < 0:
+            continue
+        points.append((t, s))
+    points.sort(key=lambda p: p[0])
+
+    n = int(points[-1][0]) + 1 if points else 0
+    out: dict[str, Any] = {"t0_epoch_s": t0_epoch}
+    for name, key in keys.items():
+        series: list[float | None] = [None] * n
+        if key:
+            for i, (t, s) in enumerate(points):
+                v = s.get(key)
+                if not isinstance(v, (int, float)) or isinstance(v, bool):
+                    continue
+                t_next = points[i + 1][0] if i + 1 < len(points) else t + 1
+                end = t_next if t_next - t <= _MAX_GAP_S else t + 1
+                for sec in range(int(t), min(n, max(int(t) + 1, int(end)))):
+                    series[sec] = float(v)
+        out[name] = series
+    return out
+
+
+def _vals(series: list[float | None]) -> list[float]:
+    return [v for v in series if v is not None]
+
+
+def _mean(xs: list[float]) -> float | None:
+    return sum(xs) / len(xs) if xs else None
+
+
+def _normalized_power(power: list[float | None]) -> float | None:
+    p = [v if v is not None else 0.0 for v in power]
+    if len(p) < 30:
+        return None
+    window = sum(p[:30])
+    rolling = [window / 30]
+    for i in range(30, len(p)):
+        window += p[i] - p[i - 30]
+        rolling.append(window / 30)
+    return (sum(r ** 4 for r in rolling) / len(rolling)) ** 0.25
+
+
+def _segment_stats(tr: dict[str, Any], start: int, end: int) -> dict[str, Any]:
+    """Power / cadence / HR stats for seconds [start, end) plus in-block fade."""
+    pw, cad, hr = (tr[k][start:end] for k in ("power", "cadence", "hr"))
+    p_vals = _vals(pw)
+    c_vals = [c for c in _vals(cad) if c > 0]
+    h_vals = _vals(hr)
+    out: dict[str, Any] = {
+        "start": _format_time(start) or "0:00",
+        "duration": _format_time(end - start),
+        "avg_power_w": _round(_mean(p_vals), 0),
+        "np_w": _round(_normalized_power(pw), 0) if end - start >= 60 else None,
+        "max_power_w": _round(max(p_vals), 0) if p_vals else None,
+        "avg_cadence_rpm": _round(_mean(c_vals), 0),
+        "avg_hr_bpm": _round(_mean(h_vals), 0),
+        "max_hr_bpm": _round(max(h_vals), 0) if h_vals else None,
+    }
+    # Fade: first third vs last third of the block (only for blocks >= 2 min).
+    if end - start >= 120:
+        third = (end - start) // 3
+
+        def _part(series: list[float | None], a: int, b: int, positive: bool = False) -> float | None:
+            xs = _vals(series[a:b])
+            if positive:
+                xs = [x for x in xs if x > 0]
+            return _mean(xs)
+
+        p1, p3 = _part(pw, 0, third), _part(pw, 2 * third, end - start)
+        c1, c3 = _part(cad, 0, third, True), _part(cad, 2 * third, end - start, True)
+        h1, h3 = _part(hr, 0, third), _part(hr, 2 * third, end - start)
+        fade: dict[str, Any] = {
+            "power_first_last_w": [_round(p1, 0), _round(p3, 0)],
+            "cadence_first_last_rpm": [_round(c1, 0), _round(c3, 0)],
+            "hr_first_last_bpm": [_round(h1, 0), _round(h3, 0)],
+        }
+        if p1 and p3 and h1 and h3:
+            # Cardiac drift: how much more HR per watt at the end of the block.
+            fade["hr_per_watt_drift_pct"] = _round(((h3 / p3) / (h1 / p1) - 1) * 100, 1)
+        out["fade"] = fade
+    return out
+
+
+def _parse_gmt(ts: Any) -> float | None:
+    if not isinstance(ts, str):
+        return None
+    try:
+        from datetime import timezone
+        return datetime.fromisoformat(ts.replace("Z", "")[:19]).replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+_STRUCTURED_LAP_TYPES = {"WARMUP", "COOLDOWN", "REST", "RECOVERY", "INTERVAL"}
+
+
+def _lap_boundaries(laps: list[dict[str, Any]], t0_epoch: float | None, n: int) -> list[tuple[int, int, str]]:
+    """(start_s, end_s, type) per lap on the trace's time axis."""
+    bounds: list[tuple[int, int, str]] = []
+    cursor = 0.0
+    for lap in laps:
+        dur = lap.get("elapsedDuration") or lap.get("duration")
+        if not isinstance(dur, (int, float)) or dur <= 0:
+            continue
+        start = cursor
+        abs_start = _parse_gmt(lap.get("startTimeGMT"))
+        if t0_epoch is not None and abs_start is not None:
+            start = max(0.0, abs_start - t0_epoch)
+        end = start + float(dur)
+        cursor = end
+        s, e = int(round(start)), min(n, int(round(end)))
+        if e - s >= 5:
+            bounds.append((s, e, (lap.get("intensityType") or "").upper()))
+    return bounds
+
+
+def _detect_blocks(power: list[float | None]) -> list[tuple[int, int, str]]:
+    """Split a ride into work / recovery blocks from the power trace alone.
+
+    30s-smoothed power is clustered into two levels (1-D 2-means); seconds
+    above the midpoint are 'work'. Segments shorter than 45s are merged
+    into the previous one. Steady rides come back as a single block.
+    """
+    n = len(power)
+    if n < 120:
+        return [(0, n, "STEADY")]
+    p = [v if v is not None else 0.0 for v in power]
+    half = 15
+    prefix = [0.0]
+    for v in p:
+        prefix.append(prefix[-1] + v)
+    smooth = [(prefix[min(n, i + half)] - prefix[max(0, i - half)]) / (min(n, i + half) - max(0, i - half))
+              for i in range(n)]
+    ordered = sorted(smooth)
+    lo, hi = ordered[n // 5], ordered[(4 * n) // 5]
+    for _ in range(25):
+        mid = (lo + hi) / 2
+        low = [v for v in smooth if v < mid]
+        high = [v for v in smooth if v >= mid]
+        if not low or not high:
+            break
+        lo, hi = sum(low) / len(low), sum(high) / len(high)
+    if hi <= 0 or (hi - lo) / hi < 0.15:
+        return [(0, n, "STEADY")]
+    mid = (lo + hi) / 2
+
+    segs: list[list[Any]] = []
+    for i, v in enumerate(smooth):
+        label = "WORK" if v >= mid else "RECOVERY"
+        if segs and segs[-1][2] == label:
+            segs[-1][1] = i + 1
+        else:
+            segs.append([i, i + 1, label])
+    merged: list[list[Any]] = []
+    for seg in segs:
+        if merged and (seg[1] - seg[0] < 45 or merged[-1][2] == seg[2]):
+            merged[-1][1] = seg[1]
+        else:
+            merged.append(seg)
+    if len(merged) > 1 and merged[0][1] - merged[0][0] < 45:
+        merged[1][0] = 0
+        merged.pop(0)
+    if len(merged) > 2:
+        if merged[0][2] == "RECOVERY":
+            merged[0][2] = "WARMUP"
+        if merged[-1][2] == "RECOVERY":
+            merged[-1][2] = "COOLDOWN"
+    return [(s, e, lab) for s, e, lab in merged]
+
+
+@mcp.tool()
+def get_ride_trace(activity_id: int, bucket_seconds: int = 30) -> dict[str, Any]:
+    """Second-by-second power, cadence and HR of a ride, condensed for analysis.
+
+    The data behind Garmin Connect's power / cadence / HR charts. Ideal for
+    indoor trainer sessions and structured workouts. Returns:
+      - session: duration, avg/NP/max power, avg cadence (zeros excluded),
+        avg/max HR, coasting time
+      - blocks: one row per workout step (when the ride followed a
+        structured workout) or per work/recovery block detected from the
+        power trace. Each with start, duration, avg power, NP, max power,
+        avg cadence, avg/max HR, and for blocks >= 2 min the fade: power,
+        cadence and HR in the first vs last third, plus HR-per-watt drift %
+      - cadence: time in cadence bands, and avg cadence in work vs recovery
+      - trace: power / cadence / HR averaged every `bucket_seconds`
+        (default 30, min 5) - the chart as numbers
+
+    Use this to judge how intervals were executed (did power hold, did
+    cadence drop, did HR drift), to compare similar trainer sessions, or
+    whenever the user asks about cadence or the shape of a ride. Get the
+    activity_id from get_activities().
+    """
+    bucket = max(5, min(int(bucket_seconds), 300))
+    client = _get_client()
+    summary = _safe(lambda: client.get_activity(activity_id)) or {}
+    s = (summary.get("summaryDTO") or {}) if isinstance(summary, dict) else {}
+    duration = s.get("elapsedDuration") or s.get("duration")
+    max_points = 2000
+    if isinstance(duration, (int, float)):
+        max_points = int(min(25000, max(2000, duration + 200)))
+
+    details = _safe(lambda: client.get_activity_details(activity_id, maxchart=max_points, maxpoly=0))
+    samples, available = _detail_samples(details)
+    if not samples:
+        return {"activity_id": activity_id, "error": "No detail samples returned by Garmin for this activity."}
+
+    tr = _resample_1hz(samples, available)
+    n = len(tr["power"])
+    has_power = any(v is not None for v in tr["power"])
+    if not has_power:
+        return {
+            "activity_id": activity_id,
+            "error": "No power channel in this activity.",
+            "available_metrics": available,
+        }
+
+    # Blocks: structured workout laps if present, else detected from power.
+    splits = _safe(lambda: client.get_activity_splits(activity_id)) or {}
+    laps = (splits.get("lapDTOs") or splits.get("laps") or []) if isinstance(splits, dict) else []
+    laps = [l for l in laps if isinstance(l, dict)]
+    structured = len(laps) >= 2 and any(
+        (l.get("intensityType") or "").upper() in _STRUCTURED_LAP_TYPES or l.get("wktStepIndex") is not None
+        for l in laps
+    )
+    if structured:
+        bounds = _lap_boundaries(laps, tr["t0_epoch_s"], n)
+        source = "workout_laps"
+    else:
+        bounds = _detect_blocks(tr["power"])
+        source = "detected_from_power"
+
+    blocks = []
+    work_cad: list[float] = []
+    rec_cad: list[float] = []
+    for i, (a, b, kind) in enumerate(bounds[:60], start=1):
+        kind_l = kind.lower() or "active"
+        if kind_l == "rest":
+            kind_l = "recovery"
+        blocks.append({"block": i, "type": kind_l, **_segment_stats(tr, a, b)})
+        cads = [c for c in _vals(tr["cadence"][a:b]) if c > 0]
+        if kind_l in ("recovery", "warmup", "cooldown"):
+            if kind_l == "recovery":
+                rec_cad.extend(cads)
+        else:
+            work_cad.extend(cads)
+
+    # Cadence distribution over the whole ride.
+    cad_all = _vals(tr["cadence"])
+    bands = {"coasting_0": 0, "<70": 0, "70-80": 0, "80-90": 0, "90-100": 0, ">100": 0}
+    for c in cad_all:
+        if c <= 0:
+            bands["coasting_0"] += 1
+        elif c < 70:
+            bands["<70"] += 1
+        elif c < 80:
+            bands["70-80"] += 1
+        elif c < 90:
+            bands["80-90"] += 1
+        elif c < 100:
+            bands["90-100"] += 1
+        else:
+            bands[">100"] += 1
+    total = sum(bands.values()) or 1
+    cadence_info = {
+        "time_in_band": {k: {"min": _round(v / 60, 1), "pct": _round(v / total * 100, 0)} for k, v in bands.items()},
+        "avg_cadence_work_rpm": _round(_mean(work_cad), 0),
+        "avg_cadence_recovery_rpm": _round(_mean(rec_cad), 0),
+    }
+
+    # Condensed trace, column-oriented to keep it compact.
+    trace: dict[str, list[Any]] = {"t": [], "power_w": [], "cadence_rpm": [], "hr_bpm": []}
+    for a in range(0, n, bucket):
+        b = min(n, a + bucket)
+        trace["t"].append(_format_time(a) or "0:00")
+        trace["power_w"].append(_round(_mean(_vals(tr["power"][a:b])), 0))
+        trace["cadence_rpm"].append(_round(_mean([c for c in _vals(tr["cadence"][a:b]) if c > 0]), 0))
+        trace["hr_bpm"].append(_round(_mean(_vals(tr["hr"][a:b])), 0))
+
+    session = _segment_stats(tr, 0, n)
+    session.pop("start", None)
+    session.pop("fade", None)
+    session["coasting_min"] = _round(bands["coasting_0"] / 60, 1)
+
+    return {
+        "activity_id": activity_id,
+        "name": summary.get("activityName") if isinstance(summary, dict) else None,
+        "sample_count": len(samples),
+        "session": session,
+        "blocks_source": source,
+        "blocks": blocks,
+        "cadence": cadence_info,
+        "bucket_seconds": bucket,
+        "trace": trace,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Tool 24: get_mindfulness_session
 # ---------------------------------------------------------------------------
 

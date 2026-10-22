@@ -50,9 +50,9 @@ TOOLS = {
 def main() -> int:
     filt = sys.argv[1] if len(sys.argv) > 1 else None
 
-    if filt and filt not in TOOLS and filt != "dynamics":
+    if filt and filt not in TOOLS and filt not in ("dynamics", "trace"):
         print(f"Unknown tool: {filt}")
-        print(f"Available: {', '.join(TOOLS.keys())}, dynamics")
+        print(f"Available: {', '.join(TOOLS.keys())}, dynamics, trace")
         return 1
 
     last_activity_id = None
@@ -67,6 +67,15 @@ def main() -> int:
                 if a.get("sport") == "run":
                     last_activity_id = a.get("activity_id")
                     break
+
+    # get_ride_trace needs an activity_id; use the latest bike activity.
+    if not filt or filt == "trace":
+        acts = garmin_mcp.get_activities(30).get("activities", [])
+        bike = next((a for a in acts if a.get("sport") == "bike"), None)
+        if bike:
+            _run("get_ride_trace", garmin_mcp.get_ride_trace, bike["activity_id"])
+        else:
+            print("\n  [skipping get_ride_trace: no bike activity in the last 30 days]")
 
     # get_running_dynamics needs an activity_id; use the latest run we saw.
     if (not filt or filt == "dynamics") and last_activity_id:
