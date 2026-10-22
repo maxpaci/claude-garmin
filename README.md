@@ -235,6 +235,7 @@ Claude calls them automatically as needed — you don't have to memorize them, b
 | `get_training_load` | acute / chronic load, ACWR ratio, base/tempo/threshold/anaerobic breakdown |
 | `get_stress_data(days=7)` | daily stress (rest/low/medium/high minutes) |
 | `get_personal_records` | PRs by sport (best times across distances, longest, power records) |
+| `get_power_curve(days=90, compare_previous=True)` | cycling power curve: best watts (and W/kg) for 5s–60min, FTP estimate from 20min, % change vs the previous period |
 
 ---
 

@@ -43,6 +43,7 @@ TOOLS = {
     "training_load": ("get_training_load",    garmin_mcp.get_training_load,    ()),
     "stress":        ("get_stress_data",      garmin_mcp.get_stress_data,      (7,)),
     "records":       ("get_personal_records", garmin_mcp.get_personal_records, ()),
+    "power_curve":   ("get_power_curve",      garmin_mcp.get_power_curve,      (90,)),
 }
 
 

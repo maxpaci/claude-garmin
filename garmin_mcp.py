@@ -2133,6 +2133,214 @@ def get_bike_session(activity_id: int) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Tool 23b: get_power_curve
+# ---------------------------------------------------------------------------
+
+# Standard durations (seconds) reported by get_power_curve.
+_POWER_CURVE_DURATIONS = (5, 15, 30, 60, 120, 300, 600, 1200, 1800, 3600)
+
+_DURATION_KEYS = ("duration", "durationInSeconds", "durationSeconds", "seconds", "time", "x")
+_POWER_KEYS = ("power", "watts", "value", "maxPower", "bestPower", "avgPower", "y")
+
+
+def _fmt_duration_label(secs: int) -> str:
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}min"
+    return f"{secs // 3600}h"
+
+
+def _first_number(d: dict[str, Any], keys: tuple[str, ...]) -> float | None:
+    for k in keys:
+        v = d.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return float(v)
+    return None
+
+
+def _extract_power_points(raw: Any) -> dict[int, dict[str, Any]]:
+    """Pull {duration_s: {power_w, activity_id, date}} out of a power-curve payload.
+
+    Garmin does not document this response and its shape has varied, so
+    we walk the JSON looking for any of the common layouts:
+      - a list of dicts with a duration-like and a power-like key
+      - a list of [duration, power] pairs
+      - parallel arrays (e.g. {"durations": [...], "powers": [...]})
+    Keeps the best power per duration if several are found.
+    """
+    points: dict[int, dict[str, Any]] = {}
+
+    def _add(dur: Any, pw: Any, extra: dict[str, Any] | None = None) -> None:
+        if not isinstance(dur, (int, float)) or not isinstance(pw, (int, float)):
+            return
+        if isinstance(dur, bool) or isinstance(pw, bool) or dur <= 0 or pw <= 0:
+            return
+        d = int(round(dur))
+        if d in points and points[d]["power_w"] >= pw:
+            return
+        entry: dict[str, Any] = {"power_w": int(round(pw))}
+        if extra:
+            aid = extra.get("activityId") or extra.get("activity_id")
+            when = extra.get("startDate") or extra.get("date") or extra.get("startTimeLocal")
+            if aid is not None:
+                entry["activity_id"] = aid
+            if when is not None:
+                entry["date"] = str(when)[:10]
+        points[d] = entry
+
+    def _walk(node: Any, depth: int = 0) -> None:
+        if depth > 6:
+            return
+        if isinstance(node, list):
+            for item in node:
+                if isinstance(item, dict):
+                    dur = _first_number(item, _DURATION_KEYS)
+                    pw = _first_number(item, _POWER_KEYS)
+                    if dur is not None and pw is not None:
+                        _add(dur, pw, item)
+                        continue
+                    _walk(item, depth + 1)
+                elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                    _add(item[0], item[1])
+        elif isinstance(node, dict):
+            # Parallel arrays: one list of durations, one list of powers.
+            dur_list = next((v for k, v in node.items()
+                             if isinstance(v, list) and "duration" in k.lower()), None)
+            pw_list = next((v for k, v in node.items()
+                            if isinstance(v, list) and ("power" in k.lower() or "watt" in k.lower())), None)
+            if dur_list and pw_list and len(dur_list) == len(pw_list) \
+                    and all(isinstance(x, (int, float)) for x in dur_list[:5]):
+                for dur, pw in zip(dur_list, pw_list):
+                    _add(dur, pw)
+            for v in node.values():
+                if isinstance(v, (list, dict)):
+                    _walk(v, depth + 1)
+
+    _walk(raw)
+    return points
+
+
+def _pick_standard(points: dict[int, dict[str, Any]]) -> dict[str, Any]:
+    """Map raw points onto the standard durations (exact, else nearest within 10%)."""
+    out: dict[str, Any] = {}
+    if not points:
+        return out
+    available = sorted(points)
+    for target in _POWER_CURVE_DURATIONS:
+        best = min(available, key=lambda d: abs(d - target))
+        if abs(best - target) <= max(1, target * 0.10):
+            out[_fmt_duration_label(target)] = {"duration_s": target, **points[best]}
+    return out
+
+
+def _fetch_power_curve(client: Any, start: date, end: date) -> Any:
+    s, e = start.isoformat(), end.isoformat()
+    if hasattr(client, "get_power_curve"):
+        return client.get_power_curve(s, e, "cycling")
+    # Older garminconnect versions lack the helper: call the endpoint directly.
+    return client.connectapi(
+        "/fitnessstats-service/powerCurve",
+        params={"startDate": s, "endDate": e, "sport": "cycling"},
+    )
+
+
+@mcp.tool()
+def get_power_curve(days: int = 90, compare_previous: bool = True) -> dict[str, Any]:
+    """Cycling power curve: best power for standard durations over a period.
+
+    Returns best watts for 5s, 15s, 30s, 1min, 2min, 5min, 10min, 20min,
+    30min and 60min over the last `days` days (default 90), with the
+    activity and date each best came from when Garmin provides them.
+    Also returns watts/kg if body weight is known, the current FTP for
+    context, and - when `compare_previous` is true - the same curve for
+    the preceding period of equal length with the % change per duration.
+
+    Use this when the user asks about power profile, sprint vs. climbing
+    strength, best efforts, whether their power is improving, pacing a
+    climb or a time trial, or FTP estimates (e.g. 95% of best 20min).
+    """
+    days = max(7, min(int(days), 730))
+    client = _get_client()
+    today = date.today()
+    cur_start = today - timedelta(days=days - 1)
+    prev_end = cur_start - timedelta(days=1)
+    prev_start = prev_end - timedelta(days=days - 1)
+
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        f_cur = ex.submit(_safe, lambda: _fetch_power_curve(client, cur_start, today))
+        f_prev = ex.submit(_safe, lambda: _fetch_power_curve(client, prev_start, prev_end)) \
+            if compare_previous else None
+        f_ftp = ex.submit(_safe, lambda: client.get_cycling_ftp())
+        cur_raw = f_cur.result()
+        prev_raw = f_prev.result() if f_prev else None
+        ftp_raw = f_ftp.result()
+
+    cur_points = _extract_power_points(cur_raw)
+    current = _pick_standard(cur_points)
+
+    ftp_w: int | None = None
+    if isinstance(ftp_raw, dict):
+        v = ftp_raw.get("functionalThresholdPower") or ftp_raw.get("ftp")
+        ftp_w = int(v) if isinstance(v, (int, float)) else None
+    elif isinstance(ftp_raw, (int, float)):
+        ftp_w = int(ftp_raw)
+
+    weight_kg: float | None = None
+    # Average over the last 30 days: a single day rarely has a weigh-in.
+    weight_raw = _safe(lambda: client.get_body_composition(
+        (today - timedelta(days=30)).isoformat(), today.isoformat()))
+    if isinstance(weight_raw, dict):
+        avg = weight_raw.get("totalAverage") or {}
+        w = avg.get("weight") if isinstance(avg, dict) else None
+        if isinstance(w, (int, float)) and w > 0:
+            weight_kg = round(w / 1000 if w > 500 else w, 1)  # Garmin uses grams
+    if weight_kg:
+        for entry in current.values():
+            entry["w_per_kg"] = round(entry["power_w"] / weight_kg, 2)
+
+    result: dict[str, Any] = {
+        "period": {"start": cur_start.isoformat(), "end": today.isoformat(), "days": days},
+        "best_efforts": current or None,
+        "cycling_ftp_w": ftp_w,
+        "weight_kg": weight_kg,
+    }
+    best20 = current.get("20min")
+    if best20:
+        result["ftp_estimate_from_20min_w"] = int(round(best20["power_w"] * 0.95))
+
+    if compare_previous:
+        previous = _pick_standard(_extract_power_points(prev_raw))
+        changes: dict[str, Any] = {}
+        for label, entry in current.items():
+            p = previous.get(label)
+            if p and p["power_w"]:
+                changes[label] = {
+                    "previous_w": p["power_w"],
+                    "current_w": entry["power_w"],
+                    "change_pct": round((entry["power_w"] - p["power_w"]) / p["power_w"] * 100, 1),
+                }
+        result["previous_period"] = {
+            "start": prev_start.isoformat(),
+            "end": prev_end.isoformat(),
+            "best_efforts": previous or None,
+        }
+        result["change_vs_previous"] = changes or None
+
+    if not current:
+        # Unknown payload shape or no power data: hand back a trimmed sample
+        # so the problem is visible instead of silently returning nothing.
+        sample = str(cur_raw)
+        result["note"] = (
+            "No power-curve points parsed. Either there are no rides with a "
+            "power meter in this period, or Garmin changed the response format."
+        )
+        result["raw_sample"] = sample[:1500] if cur_raw else None
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Tool 24: get_mindfulness_session
 # ---------------------------------------------------------------------------
 
@@ -2318,12 +2526,8 @@ def get_full_snapshot(activity_days: int = 14, load_days: int = 28) -> dict[str,
         "recent_activities": lambda: get_activities(activity_days),
         "stress": lambda: get_stress_data(7),
         "personal_records": lambda: get_personal_records(),
-        "hr_zones": lambda: get_hr_zones(),
-        "power_zones": lambda: get_power_zones(),
+        "power_curve": lambda: get_power_curve(90, False),
         "endurance_score": lambda: get_endurance_score(),
-        "hill_score": lambda: get_hill_score(),
-        "race_predictions": lambda: get_race_predictions(),
-        "training_effect": lambda: get_training_effect(),
         "lactate_threshold": lambda: get_lactate_threshold(),
         "training_plans": lambda: get_training_plans_list(),
         "progress_summary": lambda: get_progress_summary(90, "distance"),
