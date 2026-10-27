@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
@@ -1496,8 +1497,9 @@ def get_lactate_threshold() -> dict[str, Any]:
     """Lactate threshold: speed/power and heart rate at threshold intensity.
 
     Returns:
-      - threshold_pace_min_km and threshold_hr_bpm (running)
-      - threshold_power_w and power_to_weight (cycling, if available)
+      - running: threshold pace, threshold HR, and Garmin's RUNNING power
+        at threshold (running power, not comparable with bike watts)
+      - cycling: threshold HR and the cycling FTP
       - date of the last measurement
 
     The lactate threshold is the highest intensity at which lactate
@@ -1507,6 +1509,7 @@ def get_lactate_threshold() -> dict[str, Any]:
     """
     client = _get_client()
     raw = _safe(lambda: client.get_lactate_threshold())
+    ftp_raw = _safe(lambda: client.get_cycling_ftp())
     if not isinstance(raw, dict):
         return {"error": "lactate threshold data not available"}
 
@@ -1524,14 +1527,26 @@ def get_lactate_threshold() -> dict[str, Any]:
     power_w = power_data.get("power") or power_data.get("functionalThresholdPower")
     p2w = power_data.get("powerToWeightRatio") or power_data.get("value")
 
+    if isinstance(ftp_raw, list) and ftp_raw:
+        ftp_raw = ftp_raw[0]
+    ftp = None
+    if isinstance(ftp_raw, dict):
+        ftp = ftp_raw.get("functionalThresholdPower") or ftp_raw.get("ftp")
+    hr_cyc = shr.get("heartRateCycling")
+
     return {
         "date": shr.get("calendarDate"),
-        "threshold_pace_min_km": pace,
-        "threshold_speed_raw": _round(speed_raw, 4) if isinstance(speed_raw, (int, float)) else None,
-        "threshold_hr_bpm": hr_bpm,
-        "threshold_hr_cycling_bpm": shr.get("heartRateCycling"),
-        "threshold_power_w": int(power_w) if isinstance(power_w, (int, float)) else None,
-        "power_to_weight_w_kg": _round(p2w, 2) if isinstance(p2w, (int, float)) else None,
+        "running": {
+            "threshold_pace_min_km": pace,
+            "threshold_hr_bpm": hr_bpm,
+            # Garmin asks this endpoint for sport=Running: it is running power.
+            "threshold_running_power_w": int(power_w) if isinstance(power_w, (int, float)) else None,
+            "running_power_to_weight_w_kg": _round(p2w, 2) if isinstance(p2w, (int, float)) else None,
+        },
+        "cycling": {
+            "threshold_hr_bpm": int(hr_cyc) if isinstance(hr_cyc, (int, float)) else None,
+            "ftp_w": int(ftp) if isinstance(ftp, (int, float)) else None,
+        },
     }
 
 
@@ -1653,13 +1668,42 @@ def get_endurance_score() -> dict[str, Any]:
     if not isinstance(raw, dict):
         return {"error": "endurance score not available (requires compatible device)"}
 
-    return {
+    # Some responses wrap the day in an "enduranceScoreDTO" block.
+    if isinstance(raw.get("enduranceScoreDTO"), dict):
+        raw = raw["enduranceScoreDTO"]
+    score = raw.get("overallScore") or raw.get("overallEnduranceScore") or raw.get("score")
+
+    # Level: Garmin sends the lower bound of each band; pick the highest one reached.
+    bands = [("Intermediate", "classificationLowerLimitIntermediate"), ("Trained", "classificationLowerLimitTrained"),
+             ("Well-Trained", "classificationLowerLimitWellTrained"), ("Expert", "classificationLowerLimitExpert"),
+             ("Superior", "classificationLowerLimitSuperior"), ("Elite", "classificationLowerLimitElite")]
+    level = None
+    if isinstance(score, (int, float)):
+        level = "Recreational"
+        for name, key in bands:
+            limit = raw.get(key)
+            if isinstance(limit, (int, float)) and score >= limit:
+                level = name
+
+    contributors = []
+    for c in raw.get("contributors") or []:
+        if isinstance(c, dict) and isinstance(c.get("contribution"), (int, float)):
+            contributors.append({
+                "activity_type_id": c.get("activityTypeId"),
+                "group": c.get("group"),
+                "contribution_pct": _round(c.get("contribution"), 1),
+            })
+
+    out: dict[str, Any] = {
         "date": raw.get("calendarDate") or today,
-        "score": raw.get("overallEnduranceScore") or raw.get("score") or raw.get("value"),
-        "qualifier": raw.get("overallEnduranceQualifier") or raw.get("qualifier"),
-        "run_score": raw.get("runEnduranceScore") or raw.get("runScore"),
-        "bike_score": raw.get("bikeEnduranceScore") or raw.get("bikeScore"),
+        "score": score,
+        "level": level,
+        "classification_code": raw.get("classification"),
+        "contributors": contributors or None,
     }
+    if score is None:
+        out["raw_sample"] = str(raw)[:600]
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -2129,6 +2173,208 @@ def get_bike_session(activity_id: int) -> dict[str, Any]:
         "max_hr_bpm": _round(s.get("maxHR"), 0) if isinstance(s.get("maxHR"), (int, float)) else None,
         "hr_time_in_zones_sec": _zones_to_dict(hr_zones),
         "power_time_in_zones_sec": _zones_to_dict(power_zones),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool 23d: get_performance_trend
+# ---------------------------------------------------------------------------
+
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+_SERIES_DATE_KEYS = ("calendarDate", "date", "from", "startDate", "weekStartDate", "summaryDate")
+
+
+def _collect_series(raw: Any, value_keys: tuple[str, ...], under: str | None = None) -> dict[str, float]:
+    """Walk an undocumented Garmin payload and pull {YYYY-MM-DD: value} pairs.
+
+    A value counts when it sits in a dict that also carries (or inherits
+    from a date-keyed parent, e.g. {"2026-10-20": {...}}) a date. With
+    `under`, only dicts reached through a key of that name count — used to
+    separate e.g. the "cycling" and "generic" VO2max blocks.
+    """
+    out: dict[str, float] = {}
+
+    def walk(node: Any, ctx_date: str | None, inside: bool, depth: int) -> None:
+        if depth > 8:
+            return
+        if isinstance(node, list):
+            for item in node:
+                walk(item, ctx_date, inside, depth + 1)
+            return
+        if not isinstance(node, dict):
+            return
+        d = ctx_date
+        for k in _SERIES_DATE_KEYS:
+            v = node.get(k)
+            if isinstance(v, str) and _DATE_RE.match(v):
+                d = v[:10]
+                break
+        if d and (inside or under is None):
+            for vk in value_keys:
+                v = node.get(vk)
+                if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+                    out[d] = float(v)
+                    break
+        for k, v in node.items():
+            if isinstance(v, (dict, list)):
+                key_date = k[:10] if isinstance(k, str) and _DATE_RE.match(k) else None
+                walk(v, key_date or d, inside or (under is not None and k == under), depth + 1)
+
+    walk(raw, None, False, 0)
+    return out
+
+
+def _weekly(series: dict[str, float], weeks: list[str], carry: bool = False) -> list[float | None]:
+    """Last value of each ISO week (keyed by its Monday).
+
+    With `carry`, a week without a new value repeats the last known one
+    (for settings like FTP that stay valid until they change).
+    """
+    by_week: dict[str, tuple[str, float]] = {}
+    for d, v in series.items():
+        try:
+            day = date.fromisoformat(d)
+        except ValueError:
+            continue
+        monday = (day - timedelta(days=day.weekday())).isoformat()
+        if monday not in by_week or d > by_week[monday][0]:
+            by_week[monday] = (d, v)
+    out: list[float | None] = []
+    last: float | None = None
+    if carry:
+        earlier = [v for d, v in sorted(series.items()) if d < weeks[0]] if weeks else []
+        last = earlier[-1] if earlier else None
+    for w in weeks:
+        if w in by_week:
+            last = by_week[w][1]
+            out.append(_round(last, 1))
+        else:
+            out.append(_round(last, 1) if carry and last is not None else None)
+    return out
+
+
+def _trend_summary(series: dict[str, float]) -> dict[str, Any] | None:
+    if not series:
+        return None
+    items = sorted(series.items())
+    first_d, first_v = items[0]
+    last_d, last_v = items[-1]
+    peak_d, peak_v = max(items, key=lambda kv: kv[1])
+    return {
+        "first": {"date": first_d, "value": _round(first_v, 1)},
+        "latest": {"date": last_d, "value": _round(last_v, 1)},
+        "peak": {"date": peak_d, "value": _round(peak_v, 1)},
+        "change": _round(last_v - first_v, 1),
+    }
+
+
+def _compact(raw: Any, depth: int = 0) -> Any:
+    """Trim a payload for display: drop ids/empties, cap lists and depth."""
+    if depth > 3:
+        return None
+    if isinstance(raw, dict):
+        out = {}
+        for k, v in raw.items():
+            if k.lower().endswith(("pk", "id", "uuid")) or v in (None, "", [], {}):
+                continue
+            c = _compact(v, depth + 1)
+            if c not in (None, [], {}):
+                out[k] = c
+        return out
+    if isinstance(raw, list):
+        return [c for c in (_compact(x, depth + 1) for x in raw[:6]) if c not in (None, [], {})]
+    return raw
+
+
+def _raw_sample(raw: Any) -> str | None:
+    return str(raw)[:600] if raw not in (None, "", [], {}) else None
+
+
+@mcp.tool()
+def get_performance_trend(weeks: int = 26) -> dict[str, Any]:
+    """Performance stats over time - the Garmin Connect "Performance Stats" history.
+
+    Weekly series (last value of each week, Monday-keyed) for the last
+    `weeks` weeks (default 26, max 104):
+      - vo2max_cycling, vo2max_running (mL/kg/min)
+      - ftp_w (cycling FTP history)
+      - hill_score, endurance_score
+    plus, for each series, first / latest / peak value and the change.
+
+    Also today's snapshot of: cycling ability profile (Garmin's
+    climber / sprinter / all-rounder style assessment), heat and altitude
+    acclimation, and fitness age.
+
+    Use this when the user asks how VO2max, FTP or other performance
+    markers changed over months, around a target event, or after a block
+    of training. A series that comes back empty lists a raw sample under
+    `diagnostics` (unsupported device, or an unexpected response format).
+    """
+    weeks = max(4, min(int(weeks), 104))
+    client = _get_client()
+    today = date.today()
+    start_day = today - timedelta(weeks=weeks)
+    start_day -= timedelta(days=start_day.weekday())  # align to a Monday
+    s, e = start_day.isoformat(), today.isoformat()
+
+    def call(name: str, *args: Any, **kwargs: Any) -> Any:
+        fn = getattr(client, name, None)
+        if fn is None:
+            return {"_missing": f"garminconnect has no {name}(); update the library (pip install -U garminconnect)"}
+        return _safe(lambda: fn(*args, **kwargs))
+
+    jobs: dict[str, Callable[[], Any]] = {
+        "maxmet": lambda: call("get_max_metrics_range", s, e),
+        "ftp": lambda: call("get_functional_threshold_power_range", s, e, sport="CYCLING", aggregation="weekly"),
+        "hill": lambda: call("get_hill_score", s, e),
+        "endurance": lambda: call("get_endurance_score", s, e, aggregation="weekly"),
+        "ability": lambda: call("get_cycling_ability", e),
+        "acclimation": lambda: call("get_heat_altitude_acclimation", e),
+        "fitness_age": lambda: call("get_fitness_age_details", e),
+    }
+    raw: dict[str, Any] = {}
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        futures = {k: ex.submit(fn) for k, fn in jobs.items()}
+        for k, f in futures.items():
+            raw[k] = f.result()
+
+    series = {
+        "vo2max_cycling": _collect_series(raw["maxmet"], ("vo2MaxPreciseValue", "vo2MaxValue"), under="cycling"),
+        "vo2max_running": _collect_series(raw["maxmet"], ("vo2MaxPreciseValue", "vo2MaxValue"), under="generic"),
+        "ftp_w": _collect_series(raw["ftp"], ("functionalThresholdPower", "ftp", "value")),
+        "hill_score": _collect_series(raw["hill"], ("overallScore", "hillScore")),
+        "endurance_score": _collect_series(raw["endurance"], ("overallScore", "groupAverage", "enduranceScore")),
+    }
+    week_starts = []
+    w = start_day
+    while w <= today:
+        week_starts.append(w.isoformat())
+        w += timedelta(weeks=1)
+
+    source_of = {"vo2max_cycling": "maxmet", "vo2max_running": "maxmet", "ftp_w": "ftp",
+                 "hill_score": "hill", "endurance_score": "endurance"}
+    diagnostics = {
+        name: (raw[source_of[name]].get("_missing") if isinstance(raw[source_of[name]], dict)
+               and "_missing" in raw[source_of[name]] else _raw_sample(raw[source_of[name]]))
+        for name, pts in series.items() if not pts
+    }
+
+    def snapshot(key: str) -> Any:
+        r = raw[key]
+        if isinstance(r, dict) and "_missing" in r:
+            return {"unavailable": r["_missing"]}
+        return _compact(r) or None
+
+    return {
+        "period": {"start": s, "end": e, "weeks": len(week_starts)},
+        "weekly": {"week_start": week_starts, **{k: _weekly(v, week_starts, carry=(k == "ftp_w")) for k, v in series.items()}},
+        "summary": {k: _trend_summary(v) for k, v in series.items()},
+        "today": {
+            "cycling_ability": snapshot("ability"),
+            "heat_altitude_acclimation": snapshot("acclimation"),
+            "fitness_age": snapshot("fitness_age"),
+        },
+        "diagnostics": {k: v for k, v in diagnostics.items() if v} or None,
     }
 
 

@@ -236,6 +236,7 @@ Claude calls them automatically as needed — you don't have to memorize them, b
 | `get_stress_data(days=7)` | daily stress (rest/low/medium/high minutes) |
 | `get_personal_records` | PRs by sport (best times across distances, longest, power records) |
 | `get_ride_trace(activity_id, bucket_seconds=30)` | power / cadence / HR of one ride over time (the Garmin Connect charts as numbers): per-block stats from workout laps or auto-detected work/recovery blocks, in-block fade and HR drift, time in cadence bands |
+| `get_performance_trend(weeks=26)` | Performance Stats history: weekly VO2max (bike/run), FTP, hill score, endurance score with first/latest/peak; today's cycling ability, heat/altitude acclimation, fitness age |
 | `get_power_curve(days=90, compare_previous=True)` | cycling power curve: best watts (and W/kg) for 5s–60min, FTP estimate from 20min, % change vs the previous period |
 
 ---
