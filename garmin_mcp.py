@@ -2410,16 +2410,21 @@ _PERIOD_FNS: dict[str, Callable[[str], str]] = {
 
 
 def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    # Power figures come from bike rows only: running power (Garmin's
+    # running watts) is a different scale and would distort NP and bests
+    # whenever sport="all" is queried.
+    bike_rows = [r for r in rows if r.get("sport") == "bike"]
+
     def total(k: str, nd: int = 1) -> float | None:
         vals = [r[k] for r in rows if isinstance(r.get(k), (int, float))]
         return _round(sum(vals), nd) if vals else None
 
-    def best(k: str) -> int | None:
-        vals = [r[k] for r in rows if isinstance(r.get(k), (int, float))]
+    def best(k: str, src: list[dict[str, Any]] | None = None) -> int | None:
+        vals = [r[k] for r in (rows if src is None else src) if isinstance(r.get(k), (int, float))]
         return int(max(vals)) if vals else None
 
-    def weighted(k: str) -> float | None:
-        pairs = [(r[k], r.get("moving_min") or r.get("duration_min") or 0) for r in rows
+    def weighted(k: str, src: list[dict[str, Any]] | None = None) -> float | None:
+        pairs = [(r[k], r.get("moving_min") or r.get("duration_min") or 0) for r in (rows if src is None else src)
                  if isinstance(r.get(k), (int, float))]
         w = sum(p[1] for p in pairs)
         return _round(sum(v * m for v, m in pairs) / w, 0) if w else None
@@ -2433,12 +2438,12 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "tss": total("tss", 0),
         "training_load": total("training_load", 0),
         "calories": total("calories", 0),
-        "avg_np_w": weighted("np_w"),
+        "avg_np_w": weighted("np_w", bike_rows),
         "avg_hr": weighted("avg_hr"),
-        "best_np_w": best("np_w"),
-        "best_5min_w": best("best_300s_w"),
-        "best_20min_w": best("best_1200s_w"),
-        "best_60min_w": best("best_3600s_w"),
+        "best_np_w": best("np_w", bike_rows),
+        "best_5min_w": best("best_300s_w", bike_rows),
+        "best_20min_w": best("best_1200s_w", bike_rows),
+        "best_60min_w": best("best_3600s_w", bike_rows),
         "longest_km": best("distance_km"),
         "max_elevation_m": best("elevation_gain_m"),
     }
@@ -2471,6 +2476,8 @@ def query_activity_history(
         activities, km, hours (moving), elevation, TSS, training load,
         calories, duration-weighted avg NP and HR, best NP, best 5/20/60
         min power, longest ride, biggest climb. Periods oldest first.
+        Power figures always come from bike activities only, also with
+        sport="all" (running power is a different scale).
       - group_by = "none": individual activities, newest first, or sorted
         descending by `sort_by` (any column, e.g. tss, np_w, distance_km,
         elevation_gain_m, best_1200s_w, avg_speed_kmh); at most `limit`
