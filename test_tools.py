@@ -45,6 +45,7 @@ TOOLS = {
     "records":       ("get_personal_records", garmin_mcp.get_personal_records, ()),
     "power_curve":   ("get_power_curve",      garmin_mcp.get_power_curve,      (90,)),
     "performance":   ("get_performance_trend", garmin_mcp.get_performance_trend, (26,)),
+    "history":       ("sync_activity_history", garmin_mcp.sync_activity_history, ()),
 }
 
 

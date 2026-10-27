@@ -19,10 +19,15 @@ Two run modes:
 """
 from __future__ import annotations
 
+import csv
+import io
+import json
 import logging
 import os
 import re
 import sys
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from typing import Any, Callable
@@ -602,12 +607,22 @@ def _normalize_activity(activity: dict[str, Any]) -> dict[str, Any] | None:
 def _fetch_recent_activities(client: Any, days: int) -> list[dict[str, Any]]:
     """Fetch activities and filter to those within the last `days` days.
 
-    Garmin's API has no server-side date filter, so we pull a wide page
-    (limit 200) and filter client-side. 200 covers even ~6 sessions/day
-    for an entire month.
+    Pages through Garmin's newest-first list (200 per request) until the
+    page reaches past the cutoff, then filters client-side. For long
+    windows prefer query_activity_history, which works from a local cache.
     """
-    raw = _safe(lambda: client.get_activities(0, 200), default=[]) or []
     cutoff = (date.today() - timedelta(days=days)).isoformat()
+    raw: list[Any] = []
+    offset, page = 0, 200
+    while True:
+        batch = _safe(lambda o=offset: client.get_activities(o, page), default=[]) or []
+        if not isinstance(batch, list) or not batch:
+            break
+        raw.extend(batch)
+        oldest = min(((a.get("startTimeLocal") or "")[:10] for a in batch if isinstance(a, dict)), default="")
+        if len(batch) < page or oldest < cutoff or offset >= 5000:
+            break
+        offset += page
     activities: list[dict[str, Any]] = []
     for activity in raw:
         if not isinstance(activity, dict):
@@ -2174,6 +2189,338 @@ def get_bike_session(activity_id: int) -> dict[str, Any]:
         "hr_time_in_zones_sec": _zones_to_dict(hr_zones),
         "power_time_in_zones_sec": _zones_to_dict(power_zones),
     }
+
+
+# ---------------------------------------------------------------------------
+# Activity history: full local cache + query tool
+# ---------------------------------------------------------------------------
+
+EXPORT_DIR = os.path.normpath(os.path.expanduser(
+    os.environ.get("GARMIN_EXPORT_DIR")
+    or os.path.join(os.path.dirname(os.path.abspath(__file__)), "export")
+))
+_HISTORY_JSON = os.path.join(EXPORT_DIR, "activities.json")
+_HISTORY_CSV = os.path.join(EXPORT_DIR, "activities.csv")
+_HISTORY_META = os.path.join(EXPORT_DIR, "sync_meta.json")
+_HISTORY_STALE_HOURS = 6
+_history_lock = threading.Lock()
+
+_BEST_POWER_RE = re.compile(r"^maxAvgPower_(\d+)$")
+_HISTORY_COLUMNS = [
+    "activity_id", "date", "start_local", "name", "sport", "type_key", "indoor", "location",
+    "distance_km", "duration_min", "moving_min", "elevation_gain_m", "elevation_loss_m",
+    "avg_speed_kmh", "max_speed_kmh", "avg_hr", "max_hr",
+    "avg_power_w", "np_w", "max_power_w", "tss", "intensity_factor",
+    "avg_cadence", "max_cadence", "calories", "aerobic_te", "anaerobic_te", "training_load",
+    "vo2max", "min_temp_c", "max_temp_c",
+]
+
+
+def _num(v: Any, nd: int = 1) -> float | int | None:
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return _round(v, nd) if nd else int(round(v))
+
+
+def _history_record(a: dict[str, Any]) -> dict[str, Any] | None:
+    """Flatten one Garmin activity summary into a stable, analysis-ready row.
+
+    Start coordinates are deliberately dropped (they reveal where you live);
+    the Garmin location name is kept.
+    """
+    aid = a.get("activityId")
+    start = a.get("startTimeLocal") or ""
+    if aid is None or not _DATE_RE.match(start):
+        return None
+    type_key = (a.get("activityType") or {}).get("typeKey")
+    dur, mov, dist = a.get("duration"), a.get("movingDuration"), a.get("distance")
+    spd, vmax = a.get("averageSpeed"), a.get("maxSpeed")
+    rec: dict[str, Any] = {
+        "activity_id": aid,
+        "date": start[:10],
+        "start_local": start[:19].replace(" ", "T"),
+        "name": a.get("activityName"),
+        "sport": _bucket(type_key) or "other",
+        "type_key": type_key,
+        "indoor": bool(type_key and ("indoor" in type_key or "virtual" in type_key or "trainer" in type_key)),
+        "location": a.get("locationName"),
+        "distance_km": _num(dist / 1000, 2) if isinstance(dist, (int, float)) and dist > 0 else None,
+        "duration_min": _num(dur / 60) if isinstance(dur, (int, float)) else None,
+        "moving_min": _num(mov / 60) if isinstance(mov, (int, float)) else None,
+        "elevation_gain_m": _num(a.get("elevationGain"), 0),
+        "elevation_loss_m": _num(a.get("elevationLoss"), 0),
+        "avg_speed_kmh": _num(spd * 3.6) if isinstance(spd, (int, float)) and spd > 0 else None,
+        "max_speed_kmh": _num(vmax * 3.6) if isinstance(vmax, (int, float)) and vmax > 0 else None,
+        "avg_hr": _num(a.get("averageHR"), 0),
+        "max_hr": _num(a.get("maxHR"), 0),
+        "avg_power_w": _num(a.get("avgPower") or a.get("averagePower"), 0),
+        "np_w": _num(a.get("normPower") or a.get("normalizedPower"), 0),
+        "max_power_w": _num(a.get("maxPower"), 0),
+        "tss": _num(a.get("trainingStressScore")),
+        "intensity_factor": _num(a.get("intensityFactor"), 2),
+        "avg_cadence": _num(a.get("averageBikingCadenceInRevPerMinute")
+                            or a.get("averageRunningCadenceInStepsPerMinute"), 0),
+        "max_cadence": _num(a.get("maxBikingCadenceInRevPerMinute")
+                            or a.get("maxRunningCadenceInStepsPerMinute"), 0),
+        "calories": _num(a.get("calories"), 0),
+        "aerobic_te": _num(a.get("aerobicTrainingEffect")),
+        "anaerobic_te": _num(a.get("anaerobicTrainingEffect")),
+        "training_load": _num(a.get("activityTrainingLoad")),
+        "vo2max": _num(a.get("vO2MaxValue")),
+        "min_temp_c": _num(a.get("minTemperature")),
+        "max_temp_c": _num(a.get("maxTemperature")),
+    }
+    for k, v in a.items():
+        m = _BEST_POWER_RE.match(k)
+        if m and isinstance(v, (int, float)) and v > 0:
+            rec[f"best_{m.group(1)}s_w"] = int(round(v))
+    if "best_1200s_w" not in rec and isinstance(a.get("max20MinPower"), (int, float)) and a["max20MinPower"] > 0:
+        rec["best_1200s_w"] = int(round(a["max20MinPower"]))
+    return rec
+
+
+def _read_json(path: str, default: Any) -> Any:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def _write_atomic(path: str, text: str, encoding: str = "utf-8") -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding=encoding, newline="") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def _csv_for_excel_it(rows: list[dict[str, Any]]) -> str:
+    """CSV that Italian Excel opens directly: ';' separator, decimal comma, BOM."""
+    best_cols = sorted({k for r in rows for k in r if k.startswith("best_")},
+                       key=lambda k: int(k[5:-3]))
+    cols = _HISTORY_COLUMNS + best_cols
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter=";", lineterminator="\r\n")
+    w.writerow(cols)
+    for r in rows:
+        out = []
+        for c in cols:
+            v = r.get(c)
+            if v is None:
+                out.append("")
+            elif isinstance(v, bool):
+                out.append("si" if v else "no")
+            elif isinstance(v, float):
+                out.append(f"{v:g}".replace(".", ","))
+            else:
+                out.append(str(v))
+        w.writerow(out)
+    return buf.getvalue()
+
+
+def _sync_history(full: bool = False) -> dict[str, Any]:
+    """Download activity summaries into the local cache (incremental by default)."""
+    with _history_lock:
+        os.makedirs(EXPORT_DIR, exist_ok=True)
+        cached = {} if full else {r["activity_id"]: r for r in _read_json(_HISTORY_JSON, []) if isinstance(r, dict)}
+        stop_before = None
+        if cached:
+            newest = max(r["date"] for r in cached.values())
+            stop_before = (date.fromisoformat(newest) - timedelta(days=7)).isoformat()
+
+        client = _get_client()
+        page, offset, fetched, pages = 200, 0, 0, 0
+        while True:
+            batch = client.get_activities(offset, page) or []
+            pages += 1
+            if not isinstance(batch, list) or not batch:
+                break
+            oldest_in_batch = "9999"
+            for a in batch:
+                rec = _history_record(a) if isinstance(a, dict) else None
+                if rec:
+                    cached[rec["activity_id"]] = rec
+                    fetched += 1
+                    oldest_in_batch = min(oldest_in_batch, rec["date"])
+            if len(batch) < page or (stop_before and oldest_in_batch < stop_before) or pages >= 500:
+                break
+            offset += page
+            time.sleep(0.5)  # be gentle with Garmin's rate limits
+
+        rows = sorted(cached.values(), key=lambda r: r.get("start_local") or "", reverse=True)
+        _write_atomic(_HISTORY_JSON, json.dumps(rows, ensure_ascii=False, indent=0))
+        _write_atomic(_HISTORY_CSV, _csv_for_excel_it(rows), encoding="utf-8-sig")
+        meta = {
+            "last_sync": datetime.now().isoformat(timespec="seconds"),
+            "mode": "full" if (full or stop_before is None) else "incremental",
+            "pages_requested": pages,
+            "activities_fetched": fetched,
+            "activities_total": len(rows),
+            "first_date": rows[-1]["date"] if rows else None,
+            "last_date": rows[0]["date"] if rows else None,
+        }
+        _write_atomic(_HISTORY_META, json.dumps(meta, indent=1))
+        return meta
+
+
+def _history(auto_sync: bool) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    meta = _read_json(_HISTORY_META, {})
+    rows = _read_json(_HISTORY_JSON, None)
+    if auto_sync:
+        stale = True
+        try:
+            stale = datetime.now() - datetime.fromisoformat(meta["last_sync"]) > timedelta(hours=_HISTORY_STALE_HOURS)
+        except (KeyError, ValueError, TypeError):
+            pass
+        if rows is None or stale:
+            meta = _sync_history(full=rows is None)
+            rows = _read_json(_HISTORY_JSON, [])
+    return [r for r in (rows or []) if isinstance(r, dict)], meta
+
+
+@mcp.tool()
+def sync_activity_history(full: bool = False) -> dict[str, Any]:
+    """Download your Garmin activity history into local files.
+
+    First run (or full=True): every activity since the account began.
+    Later runs: only new activities (plus the last week, to pick up edits).
+    Writes, in the connector's export/ folder on this PC:
+      - activities.csv  - one row per activity; opens directly in Italian
+                          Excel (';' separator, decimal comma)
+      - activities.json - same data, used by query_activity_history
+    Columns: date, sport, type, distance, duration, elevation, speed,
+    HR, avg/NP/max power, TSS, IF, cadence, calories, training effect,
+    training load, temperature, and best power for standard durations
+    (best_1200s_w = best 20 min) when Garmin provides them. Start GPS
+    coordinates are not saved.
+
+    Use full=True after deleting or editing old activities in Garmin
+    Connect. query_activity_history syncs on its own when data is
+    older than 6 hours, so calling this is rarely needed.
+    """
+    meta = _sync_history(full=full)
+    return {**meta, "files": {"csv": _HISTORY_CSV, "json": _HISTORY_JSON}}
+
+
+_PERIOD_FNS: dict[str, Callable[[str], str]] = {
+    "year": lambda d: d[:4],
+    "month": lambda d: d[:7],
+    "week": lambda d: (date.fromisoformat(d) - timedelta(days=date.fromisoformat(d).weekday())).isoformat(),
+}
+
+
+def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    def total(k: str, nd: int = 1) -> float | None:
+        vals = [r[k] for r in rows if isinstance(r.get(k), (int, float))]
+        return _round(sum(vals), nd) if vals else None
+
+    def best(k: str) -> int | None:
+        vals = [r[k] for r in rows if isinstance(r.get(k), (int, float))]
+        return int(max(vals)) if vals else None
+
+    def weighted(k: str) -> float | None:
+        pairs = [(r[k], r.get("moving_min") or r.get("duration_min") or 0) for r in rows
+                 if isinstance(r.get(k), (int, float))]
+        w = sum(p[1] for p in pairs)
+        return _round(sum(v * m for v, m in pairs) / w, 0) if w else None
+
+    minutes = sum((r.get("moving_min") or r.get("duration_min") or 0) for r in rows)
+    return {
+        "activities": len(rows),
+        "km": total("distance_km", 0),
+        "hours": _round(minutes / 60, 1),
+        "elevation_m": total("elevation_gain_m", 0),
+        "tss": total("tss", 0),
+        "training_load": total("training_load", 0),
+        "calories": total("calories", 0),
+        "avg_np_w": weighted("np_w"),
+        "avg_hr": weighted("avg_hr"),
+        "best_np_w": best("np_w"),
+        "best_5min_w": best("best_300s_w"),
+        "best_20min_w": best("best_1200s_w"),
+        "best_60min_w": best("best_3600s_w"),
+        "longest_km": best("distance_km"),
+        "max_elevation_m": best("elevation_gain_m"),
+    }
+
+
+_ROW_FIELDS = ("activity_id", "date", "name", "type_key", "indoor", "distance_km", "moving_min",
+               "elevation_gain_m", "avg_speed_kmh", "avg_hr", "avg_power_w", "np_w", "tss",
+               "intensity_factor", "avg_cadence", "best_300s_w", "best_1200s_w", "training_load")
+
+
+@mcp.tool()
+def query_activity_history(
+    sport: str = "bike",
+    start: str = "",
+    end: str = "",
+    group_by: str = "month",
+    sort_by: str = "",
+    limit: int = 20,
+    indoor: str = "any",
+    auto_sync: bool = True,
+) -> dict[str, Any]:
+    """Analyse your whole Garmin history (since the first activity) from the local cache.
+
+    Filters:
+      - sport: bike (default), run, swim, strength, walk, hiit, other, or all
+      - start / end: YYYY-MM-DD (inclusive); empty = no limit
+      - indoor: "any" (default), "yes" (trainer/virtual), "no" (outdoor)
+    Modes:
+      - group_by = "year" | "month" | "week": one row per period with
+        activities, km, hours (moving), elevation, TSS, training load,
+        calories, duration-weighted avg NP and HR, best NP, best 5/20/60
+        min power, longest ride, biggest climb. Periods oldest first.
+      - group_by = "none": individual activities, newest first, or sorted
+        descending by `sort_by` (any column, e.g. tss, np_w, distance_km,
+        elevation_gain_m, best_1200s_w, avg_speed_kmh); at most `limit`
+        rows (max 200).
+    Always returns totals for the filtered set and the cache's date range.
+
+    The cache refreshes itself when older than 6 hours (auto_sync); the
+    first call downloads the full history and can take a few minutes.
+    Use this for season-over-season comparisons, volume and load trends,
+    best rides, and anything older than the last few weeks. For one ride
+    in depth use get_bike_session / get_ride_trace with its activity_id.
+    """
+    rows, meta = _history(auto_sync)
+    sport = (sport or "all").strip().lower()
+    if sport != "all":
+        rows = [r for r in rows if r.get("sport") == sport]
+    if start:
+        rows = [r for r in rows if r.get("date", "") >= start]
+    if end:
+        rows = [r for r in rows if r.get("date", "") <= end]
+    if indoor in ("yes", "no"):
+        want = indoor == "yes"
+        rows = [r for r in rows if bool(r.get("indoor")) == want]
+
+    out: dict[str, Any] = {
+        "cache": {k: meta.get(k) for k in ("last_sync", "activities_total", "first_date", "last_date")},
+        "filter": {"sport": sport, "start": start or None, "end": end or None, "indoor": indoor},
+        "totals": _aggregate(rows),
+    }
+    group_by = (group_by or "none").strip().lower()
+    if group_by in _PERIOD_FNS:
+        fn = _PERIOD_FNS[group_by]
+        buckets: dict[str, list[dict[str, Any]]] = {}
+        for r in rows:
+            buckets.setdefault(fn(r["date"]), []).append(r)
+        periods = [{"period": p, **_aggregate(buckets[p])} for p in sorted(buckets)]
+        if len(periods) > 260:
+            out["note"] = f"{len(periods)} periods; showing the most recent 260. Narrow start/end or use a coarser group_by."
+            periods = periods[-260:]
+        out["group_by"] = group_by
+        out["periods"] = periods
+    else:
+        limit = max(1, min(int(limit), 200))
+        if sort_by:
+            rows = sorted((r for r in rows if isinstance(r.get(sort_by), (int, float))),
+                          key=lambda r: r[sort_by], reverse=True)
+        out["sort_by"] = sort_by or "date"
+        out["activities"] = [{k: r.get(k) for k in _ROW_FIELDS if r.get(k) is not None} for r in rows[:limit]]
+        out["shown"] = len(out["activities"])
+    return out
 
 
 # ---------------------------------------------------------------------------
